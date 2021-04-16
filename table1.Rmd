@@ -1,0 +1,209 @@
+---
+title: "That's not my population. Its variance is constant "
+author:
+  - name: Frank Popham 
+date: "`r Sys.Date()`"
+output: distill::distill_article
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+
+library("tidyverse")
+library("simstudy")
+library("gt")
+library("equatiomatic")
+
+```
+
+```{r data}
+
+def <- defData(varname = "C", dist = "binary", formula = .4, link = "identity")
+def <- defData(def, varname = "X", dist = "binary", 
+               formula = ".1 + C * .4", link = "identity")
+def <- defData(def, varname = "Y", dist = "normal", 
+               formula = "10+X*10+C*20+(X*C)*40", link = "identity")
+
+set.seed(362492)
+
+dd <- genData(100000, def)
+
+
+```
+
+```{r models}
+
+y_lin_r <- glm(Y ~ X + C, data = dd) 
+
+m_log_r <- glm(X ~ C, data = dd, family=binomial) 
+
+dd <- dd %>%
+  mutate(log_r=abs(m_log_r$residuals))
+
+m_lin_r <- glm(X ~ C, data = dd, family=gaussian) 
+
+dd <- dd %>%
+  mutate(lin_r=abs(m_lin_r$residuals))
+
+y_lin_w <- glm(Y ~ X, data=dd, weights = lin_r)
+
+y_log_w <- glm(Y ~ X, data=dd, weights = log_r)
+
+
+
+y_lin_C0 <- glm(Y ~ X, data = filter(dd, C==0))
+
+y_lin_C1 <- glm(Y ~ X, data = filter(dd, C==1))
+
+```
+
+Disclaimer: This is a blog and I am a quantitative social scientist not a statistician. All this means that there may be errors, my notation is probably wrong etc.
+
+#### Not my population
+
+Often epidemiologists study the effect of an exposure on an outcome in observational data using a regression model which also adjusts for confounders. But what population, in terms of the confounders, does this effect represent? In my simple example we want to know the effect of a binary exposure $\operatorname{(X)}$ on a continuous outcome $\operatorname{(Y)}$ with a binary confounder $\operatorname{(C)}$ using a linear regression.
+
+```{r lin outcome, results = "asis"}
+
+
+extract_eq(y_lin_r)
+```
+
+As table 1 shows the percentage of $\operatorname{C}$ in the exposed (77%) is greater than in the unexposed (27%). We need to balance $\operatorname{C}$ over $\operatorname{X}$, and if we want the average treatment effect for the population then we need to balance at the average of $\operatorname{C}$ in the population. Our target population is $\operatorname{C}$ equals 40%. Although the linear regression does balance $\operatorname{C}$ it does so at a mean of 65%.
+
+```{r table 1}
+
+table_1 <- dd %>%
+  group_by(X) %>%
+  summarise(C=mean(C)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = X, names_prefix = "X", values_from=C) %>%
+  mutate(tot=mean(dd$C), Xaft_0=mean(dd$C), Xaft_1=mean(dd$C)) %>%
+  add_column(C="Confounder mean", .before="X0") 
+
+frank_table1_m <- function(.data, .w) {
+table_1_lr  <- .data %>%
+  group_by(X) %>%
+  summarise(C=weighted.mean(C, {{.w}})) %>%
+  pivot_wider(names_from = X, names_prefix = "Xaft_", values_from=C)
+bind_cols(select(table_1, -starts_with("Xaft_")), table_1_lr)   
+}
+
+frank_table1 <- function(.data, no) {
+.data %>%
+gt(rowname_col = "C") %>%
+  fmt_percent(columns = vars(X0, X1, tot, Xaft_0, Xaft_1), decimals = 0) %>%
+  cols_label(X0 = "Unexposed", X1 = "Exposed", tot="Target", 
+             Xaft_0="Unexposed", Xaft_1="Exposed") %>%
+  tab_spanner(label = "Before adjustment",
+    columns = vars(X0, X1)) %>%
+  tab_spanner(label = "After adjustment",
+    columns = vars(Xaft_0, Xaft_1)) %>%
+  tab_header(title = no)  
+}
+
+table1 <- frank_table1_m(dd, lin_r) %>%
+  frank_table1("Table 1: Confounder balance before and after linear regression")
+
+table2 <- frank_table1_m(dd, log_r) %>%
+  frank_table1("Table 2: Confounder balance before and after IPW")
+```
+
+```{r table one}
+
+table1
+
+```
+
+To work out where the linear regression is balancing I adapt [this method.](https://onlinelibrary.wiley.com/doi/abs/10.1111/ajps.12185) First, we run a linear regression of the confounder on the exposure.
+
+```{r lin first stage, results = "asis"}
+
+extract_eq(m_lin_r)
+```
+
+Second, we use the absolute value of the residual as a weight to find the weighted mean of $\operatorname{C}$ over $\operatorname{X}$.
+
+#### Working residual
+
+Effectively we are modelling a binary exposure using a linear regression with the assumption that residuals are constant over $\operatorname{C}$. However this is unlikely, and it may be better to use a logistic regression that does not assume a constant residual variance.
+
+```{r log first stage, results = "asis"}
+
+
+extract_eq(m_log_r)
+```
+
+The working residual from the above is
+
+$$
+\frac { \operatorname{X} - \operatorname{\hat{X}} } { \operatorname{\hat{X}}  * (1 - \operatorname{\hat{X}})}
+$$
+
+where $\operatorname{\hat{X}}$ is the prediction of $\operatorname{X}$. That is the residual divided by the variance of the prediction of $\operatorname{\hat{X}}$.
+
+When $\operatorname{X}$ is 1 the working residual simplifies to $$
+\frac{ \operatorname{1}}{\operatorname{\hat{X}}}
+$$
+
+which is the inverse probability weight and when $\operatorname{X}$ is 0 it simplifies to
+
+$$
+-\frac{ \operatorname{1}}{\operatorname{1} - \operatorname{\hat{X}}}
+$$
+
+which is the negative of the inverse probability weight. If we derive the weighted mean of $\operatorname{C}$ over $\operatorname{X}$ using the working residuals then we balance $\operatorname{C}$ and at the target population.
+
+```{r table two}
+
+table2
+
+```
+
+#### Does it matter?
+
+To obtain the effect of $\operatorname{X}$ on $\operatorname{Y}$ for our target population we can use the working residual as a weight in a linear regression of $\operatorname{X}$ on $\operatorname{Y}$ (i.e. not adjusting for $\operatorname{C}$). We can obtain the same effect for $\operatorname{X}$ as the linear regression of $\operatorname{X}$ on $\operatorname{Y}$ controlling for $\operatorname{C}$ by removing $\operatorname{C}$ and using the residual from the linear regression of $\operatorname{C}$ on $\operatorname{X}$ as the weight
+
+Does it matter? If there is effect modification (interaction) then it might. Figure 1 shows the effect of $\operatorname{X}$ on $\operatorname{Y}$. At the extremes are the effects for $\operatorname{C}$ equals 0 and $\operatorname{C}$ equals 1 (100% ). The effect of $\operatorname{X}$ is modified by $\operatorname{C}$. The linear regression effect is different to the average treatment effect (for the population where $\operatorname{C}$ is balanced at the population average). In this case the linear regression result is higher as it is for a population with more people who are $\operatorname{C}$ equals 1. The two stage approach of a logistic regression of $\operatorname{C}$ on $\operatorname{X}$ and then a weighted regression of $\operatorname{X}$ on $\operatorname{Y}$ effectively captures the effect modification by getting the mean and variance relationship correct at the first stage. You could always fit an outcome regression with an interaction term between $\operatorname{X}$ and $\operatorname{C}$ but then you need another stage (standardisation for example) to obtain the average effect which is (given the correct model) equivalent [to the two stage modelling approach](https://www.hsph.harvard.edu/miguel-hernan/causal-inference-book/). I have seen an [example](http://people.brandeis.edu/~tslocz/Sloczynski_paper_regression.pdf) where the effect is sign different so the population effect could be negative or positive given different compositions of the population.
+
+```{r interaction}
+
+dfeffects <- tibble(type=c("ATE","Linear", "C0","C1"),
+                 Effect=c(y_log_w$coefficients[["X"]],
+                          y_lin_r$coefficients[["X"]],
+                          y_lin_C0$coefficients[["X"]],
+                          y_lin_C1$coefficients[["X"]]),
+                 C=c(weighted.mean(dd$C, dd$log_r),
+                     weighted.mean(dd$C, dd$lin_r),
+                     0,
+                     1))
+                 
+
+figure1 <- dfeffects %>%
+  ggplot(aes(y=Effect, x=C*100, label=type)) +
+  geom_label(size=3) +
+  ylim(9, 50) +
+  xlim(0, 100) +
+  theme_bw() +
+  xlab("% C") +
+  ggtitle("Figure 1: Effect of X on Y by where C is balanced.")
+
+                 
+
+```
+
+```{r figure 1}
+
+figure1
+
+```
+
+#### Model the exposure?
+
+I am a fan, if doing this type of observational study, of modelling the exposure given confounders for many of the reasons set out by [Rubin](https://projecteuclid.org/journals/annals-of-applied-statistics/volume-2/issue-3/For-objective-causal-inference-design-trumps/10.1214/08-AOAS187.full).
+
+In conclusion it is worth checking the population that your effect represents as given effect modification it could be out. It also turns out that the "right" residual , the working residual from the first stage logistic regression, is effectively an inverse probability weight which is a "modern" way to adjust for confounding in such situations.
+
+Mega thanks to [tidyverse](https://www.tidyverse.org/), [simstudy](https://kgoldfeld.github.io/simstudy/index.html), [gt](https://gt.rstudio.com/) and [equatiomatic](https://datalorax.github.io/equatiomatic/) packages used in this blog and [knitr](https://cran.r-project.org/web/packages/knitr/index.html), [distill](https://rstudio.github.io/distill/), [R](https://www.r-project.org/) and [Rstudio](https://www.rstudio.com/) that allow me to produce the blog.
+
+[Code](https://github.com/frankpopham/table1) to reproduce this blog and analysis.
